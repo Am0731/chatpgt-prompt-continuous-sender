@@ -1,0 +1,1074 @@
+// ==UserScript==
+// @name         ChatGPT 提示词链条自动发送器 - 支持指定起始位置
+// @namespace    http://tampermonkey.net/
+// @version      2.3
+// @description  自动化发送ChatGPT提示词链条，支持动态输入数据和指定起始位置
+// @author       You
+// @match        https://chat.openai.com/*
+// @match        https://chatgpt.com/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+  'use strict';
+
+  // 配置区域 - 使用分隔符来区分不同的提示词
+  const PROMPT_SEPARATOR = '---NEXT-PROMPT---';
+
+  // 默认提示词链条（使用 {{INPUT}} 作为占位符）
+  let PROMPT_CHAIN_TEXT = `请分析以下复盘日志的背景和核心要素：
+
+{{INPUT}}
+
+请从以下维度进行分析：
+1. 事件背景和起因
+2. 关键决策点
+3. 执行过程中的问题
+4. 结果和影响
+5. 经验教训
+
+${PROMPT_SEPARATOR}
+
+基于上述分析，请提供3个具体的改进方案：
+
+1. 流程优化方案
+2. 决策机制改进方案
+3. 风险预防方案
+
+请为每个方案提供：
+- 具体实施步骤
+- 预期效果
+- 实施难度评估
+
+${PROMPT_SEPARATOR}
+
+请评估这些改进方案的可行性，并推荐最佳方案：
+
+考虑因素：
+- 实施成本
+- 预期收益
+- 风险程度
+- 组织接受度
+- 长远价值
+
+${PROMPT_SEPARATOR}
+
+请制定详细的实施计划：
+
+包括：
+- 分阶段实施时间表
+- 所需资源和人员
+- 关键里程碑和检查点
+- 风险应对和应急预案
+- 成功指标和评估标准
+
+${PROMPT_SEPARATOR}
+
+请总结本次分析的关键要点：
+
+1. 核心问题识别
+2. 最佳解决方案
+3. 实施要点
+4. 预期成果
+5. 后续跟进建议`;
+
+  // 配置选项
+  const CONFIG = {
+      SEND_DELAY: 2000,        // 发送间隔（毫秒）
+      MAX_WAIT_TIME: 300000,   // 最大等待时间（5分钟）
+      CHECK_INTERVAL: 1000     // 检查间隔（毫秒）
+  };
+
+  let currentIndex = 0;
+  let isRunning = false;
+  let controlPanel = null;
+  let promptChain = [];
+  let userInput = ''; // 存储用户输入的数据
+
+  // 解析提示词链条
+  function parsePromptChain(text) {
+      return text.split(PROMPT_SEPARATOR)
+                .map(prompt => prompt.trim())
+                .filter(prompt => prompt.length > 0);
+  }
+
+  // 初始化提示词链条
+  function initPromptChain() {
+      promptChain = parsePromptChain(PROMPT_CHAIN_TEXT);
+  }
+
+  // 替换占位符
+  function replacePlaceholders(text, input) {
+      return text.replace(/\{\{INPUT\}\}/g, input);
+  }
+
+  // 创建起始位置选择模态框
+  function createStartFromModal() {
+      const modal = document.createElement('div');
+      modal.id = 'start-from-modal';
+      modal.innerHTML = `
+          <div style="
+              position: fixed;
+              top: 0;
+              left: 0;
+              width: 100%;
+              height: 100%;
+              background: rgba(0,0,0,0.8);
+              z-index: 20000;
+              display: flex;
+              justify-content: center;
+              align-items: center;
+          ">
+              <div style="
+                  background: #2d2d2d;
+                  color: white;
+                  padding: 25px;
+                  border-radius: 10px;
+                  width: 400px;
+                  max-width: 90%;
+              ">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                      <h3 style="margin: 0; color: #4CAF50;">🎯 选择起始位置</h3>
+                      <button id="close-start-from" style="
+                          background: transparent;
+                          color: #888;
+                          border: none;
+                          font-size: 20px;
+                          cursor: pointer;
+                          padding: 0;
+                          width: 30px;
+                          height: 30px;
+                      ">×</button>
+                  </div>
+
+                  <div style="margin-bottom: 20px; font-size: 14px; color: #ccc;">
+                      <p>💡 <strong>说明：</strong></p>
+                      <p>选择从第几条提示词开始执行。总共有 <strong>${promptChain.length}</strong> 条提示词。</p>
+                      <p style="color: #ff9800;">⚠️ 注意：如果跳过第1条，请确保ChatGPT已经有了分析的基础数据。</p>
+                  </div>
+
+                  <div style="margin-bottom: 20px;">
+                      <label style="display: block; margin-bottom: 10px; font-weight: bold;">从第几条开始：</label>
+                      <input type="number" id="start-index-input" min="1" max="${promptChain.length}" value="${currentIndex + 1}" style="
+                          width: 100%;
+                          padding: 10px;
+                          border: 1px solid #555;
+                          border-radius: 5px;
+                          background: #1a1a1a;
+                          color: white;
+                          font-size: 16px;
+                          text-align: center;
+                      ">
+                      <div style="margin-top: 5px; font-size: 12px; color: #888;">
+                          范围: 1 - ${promptChain.length}
+                      </div>
+                  </div>
+
+                  <div style="margin-bottom: 20px;">
+                      <div style="font-size: 14px; color: #ccc; margin-bottom: 10px;"><strong>预览选中的提示词：</strong></div>
+                      <div id="selected-prompt-preview" style="
+                          background: #1a1a1a;
+                          padding: 10px;
+                          border-radius: 5px;
+                          max-height: 150px;
+                          overflow-y: auto;
+                          font-family: monospace;
+                          font-size: 12px;
+                          white-space: pre-wrap;
+                          border: 1px solid #555;
+                      "></div>
+                  </div>
+
+                  <div style="display: flex; justify-content: space-between;">
+                      <button id="confirm-start-from" style="
+                          background: #4CAF50;
+                          color: white;
+                          border: none;
+                          padding: 12px 24px;
+                          border-radius: 5px;
+                          cursor: pointer;
+                          font-size: 16px;
+                      ">🚀 开始执行</button>
+                      <button id="cancel-start-from" style="
+                          background: #666;
+                          color: white;
+                          border: none;
+                          padding: 12px 24px;
+                          border-radius: 5px;
+                          cursor: pointer;
+                      ">取消</button>
+                  </div>
+              </div>
+          </div>
+      `;
+
+      document.body.appendChild(modal);
+      return modal;
+  }
+
+  // 创建输入数据模态框
+  function createInputModal() {
+      const modal = document.createElement('div');
+      modal.id = 'input-data-modal';
+      modal.innerHTML = `
+          <div style="
+              position: fixed;
+              top: 0;
+              left: 0;
+              width: 100%;
+              height: 100%;
+              background: rgba(0,0,0,0.8);
+              z-index: 20000;
+              display: flex;
+              justify-content: center;
+              align-items: center;
+              padding: 20px;
+              box-sizing: border-box;
+          ">
+              <div style="
+                  background: #2d2d2d;
+                  color: white;
+                  padding: 20px;
+                  border-radius: 10px;
+                  width: 90%;
+                  max-width: 800px;
+                  height: 70%;
+                  display: flex;
+                  flex-direction: column;
+              ">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                      <h3 style="margin: 0; color: #4CAF50;">📝 输入分析数据</h3>
+                      <button id="close-input-modal" style="
+                          background: transparent;
+                          color: #888;
+                          border: none;
+                          font-size: 20px;
+                          cursor: pointer;
+                          padding: 0;
+                          width: 30px;
+                          height: 30px;
+                      ">×</button>
+                  </div>
+
+                  <div style="margin-bottom: 15px; font-size: 14px; color: #ccc;">
+                      <p>💡 <strong>使用说明：</strong></p>
+                      <ul style="margin: 5px 0; padding-left: 20px;">
+                          <li>在下方输入框中粘贴你的复盘日志、会议记录或其他需要分析的文本</li>
+                          <li>支持多行文本和格式</li>
+                          <li>这些内容将替换提示词中的 <code style="background: #444; padding: 2px 4px; border-radius: 3px;">{{INPUT}}</code> 占位符</li>
+                          <li>输入完成后点击"开始分析"按钮</li>
+                      </ul>
+                  </div>
+
+                  <textarea id="input-data-textarea" style="
+                      flex: 1;
+                      min-height: 300px;
+                      background: #1a1a1a;
+                      color: white;
+                      border: 1px solid #555;
+                      border-radius: 5px;
+                      padding: 15px;
+                      font-size: 14px;
+                      font-family: 'Consolas', 'Monaco', monospace;
+                      resize: vertical;
+                      outline: none;
+                      line-height: 1.5;
+                  " placeholder="请在这里输入你的复盘日志、会议记录或其他需要分析的内容...
+
+例如：
+项目复盘日志：
+时间：2024年7月
+项目：XXX系统升级
+参与人员：张三、李四、王五
+
+背景：
+由于业务需求增长，现有系统性能不足...
+
+过程：
+1. 需求分析阶段...
+2. 技术方案设计...
+3. 开发实施...
+
+问题：
+1. 时间估算不准确...
+2. 沟通协调不充分...
+
+结果：
+项目延期2周，但最终成功上线..."></textarea>
+
+                  <div style="margin-top: 15px; display: flex; justify-content: space-between; align-items: center;">
+                      <div style="font-size: 12px; color: #888;">
+                          字符数: <span id="input-char-count">0</span>
+                      </div>
+                      <div>
+                          <button id="start-analysis" style="
+                              background: #4CAF50;
+                              color: white;
+                              border: none;
+                              padding: 12px 24px;
+                              border-radius: 5px;
+                              cursor: pointer;
+                              margin-right: 10px;
+                              font-size: 16px;
+                          ">🚀 开始分析</button>
+                          <button id="cancel-input" style="
+                              background: #666;
+                              color: white;
+                              border: none;
+                              padding: 12px 24px;
+                              border-radius: 5px;
+                              cursor: pointer;
+                          ">取消</button>
+                      </div>
+                  </div>
+              </div>
+          </div>
+      `;
+
+      document.body.appendChild(modal);
+      return modal;
+  }
+
+  // 创建控制面板
+  function createControlPanel() {
+      const panel = document.createElement('div');
+      panel.id = 'prompt-chain-panel';
+      panel.innerHTML = `
+          <div style="
+              position: fixed;
+              top: 20px;
+              right: 20px;
+              width: 420px;
+              max-height: 85vh;
+              background: #2d2d2d;
+              color: white;
+              padding: 15px;
+              border-radius: 10px;
+              box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+              z-index: 10000;
+              font-family: Arial, sans-serif;
+              font-size: 14px;
+              overflow-y: auto;
+          ">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                  <h3 style="margin: 0; color: #4CAF50;">🤖 智能分析助手</h3>
+                  <button id="toggle-panel" style="
+                      background: transparent;
+                      color: #888;
+                      border: none;
+                      font-size: 16px;
+                      cursor: pointer;
+                      padding: 2px 6px;
+                  ">−</button>
+              </div>
+
+              <div id="panel-content">
+                  <div style="margin-bottom: 10px;">
+                      <strong>总提示词数:</strong> <span id="total-prompts">${promptChain.length}</span>
+                  </div>
+
+                  <div style="margin-bottom: 10px;">
+                      <strong>当前进度:</strong> <span id="current-progress">0/${promptChain.length}</span>
+                  </div>
+
+                  <div style="margin-bottom: 15px;">
+                      <strong>状态:</strong> <span id="status">等待输入数据</span>
+                  </div>
+
+                  <div style="margin-bottom: 15px;">
+                      <button id="input-data" style="
+                          background: #FF5722;
+                          color: white;
+                          border: none;
+                          padding: 12px 20px;
+                          border-radius: 5px;
+                          cursor: pointer;
+                          width: 100%;
+                          font-size: 16px;
+                          margin-bottom: 10px;
+                      ">📝 输入分析数据</button>
+
+                      <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+                          <button id="start-chain" style="
+                              background: #4CAF50;
+                              color: white;
+                              border: none;
+                              padding: 8px 16px;
+                              border-radius: 5px;
+                              cursor: pointer;
+                              flex: 1;
+                          " disabled>开始分析</button>
+
+                          <button id="start-from" style="
+                              background: #FF9800;
+                              color: white;
+                              border: none;
+                              padding: 8px 16px;
+                              border-radius: 5px;
+                              cursor: pointer;
+                              flex: 1;
+                          ">从第N条开始</button>
+                      </div>
+
+                      <div style="display: flex; gap: 8px; margin-bottom: 5px;">
+                          <button id="stop-chain" style="
+                              background: #f44336;
+                              color: white;
+                              border: none;
+                              padding: 8px 16px;
+                              border-radius: 5px;
+                              cursor: pointer;
+                              flex: 1;
+                          ">停止</button>
+
+                          <button id="reset-chain" style="
+                              background: #9E9E9E;
+                              color: white;
+                              border: none;
+                              padding: 8px 16px;
+                              border-radius: 5px;
+                              cursor: pointer;
+                              flex: 1;
+                          ">重置</button>
+                      </div>
+                  </div>
+
+                  <div style="margin-bottom: 15px;">
+                      <button id="edit-prompts" style="
+                          background: #2196F3;
+                          color: white;
+                          border: none;
+                          padding: 10px 20px;
+                          border-radius: 5px;
+                          cursor: pointer;
+                          width: 100%;
+                          margin-bottom: 8px;
+                      ">📝 编辑提示词模板</button>
+
+                      <button id="preview-prompts" style="
+                          background: #9C27B0;
+                          color: white;
+                          border: none;
+                          padding: 8px 16px;
+                          border-radius: 5px;
+                          cursor: pointer;
+                          width: 100%;
+                      ">👁️ 预览提示词</button>
+                  </div>
+
+                  <div style="font-size: 12px; color: #888;">
+                      <div><strong>数据状态:</strong></div>
+                      <div id="input-status" style="
+                          background: #1a1a1a;
+                          padding: 8px;
+                          border-radius: 5px;
+                          margin-top: 5px;
+                          font-family: monospace;
+                      ">未输入数据</div>
+
+                      <div style="margin-top: 10px;"><strong>下一条预览:</strong></div>
+                      <div id="next-prompt" style="
+                          background: #1a1a1a;
+                          padding: 8px;
+                          border-radius: 5px;
+                          margin-top: 5px;
+                          max-height: 100px;
+                          overflow-y: auto;
+                          white-space: pre-wrap;
+                          font-family: monospace;
+                      ">${promptChain[0] ? (promptChain[0].length > 200 ? promptChain[0].substring(0, 200) + '...' : promptChain[0]) : '无'}</div>
+                  </div>
+              </div>
+          </div>
+      `;
+
+      document.body.appendChild(panel);
+      return panel;
+  }
+
+  // 显示起始位置选择
+  function showStartFromModal() {
+      const modal = createStartFromModal();
+      const input = document.getElementById('start-index-input');
+      const preview = document.getElementById('selected-prompt-preview');
+
+      // 更新预览
+      function updatePreview() {
+          const index = parseInt(input.value) - 1;
+          if (index >= 0 && index < promptChain.length) {
+              const prompt = promptChain[index];
+              const finalPrompt = userInput ? replacePlaceholders(prompt, userInput) : prompt;
+              preview.textContent = finalPrompt.length > 500 ?
+                  finalPrompt.substring(0, 500) + '...' : finalPrompt;
+          } else {
+              preview.textContent = '无效的索引';
+          }
+      }
+
+      // 初始预览
+      updatePreview();
+
+      // 输入变化时更新预览
+      input.addEventListener('input', updatePreview);
+
+      // 确认按钮
+      document.getElementById('confirm-start-from').addEventListener('click', () => {
+          const startIndex = parseInt(input.value) - 1;
+          if (startIndex >= 0 && startIndex < promptChain.length) {
+              currentIndex = startIndex;
+              updateStatus(`设置从第 ${startIndex + 1} 条开始`, currentIndex);
+              updateNextPromptPreview();
+
+              // 关闭模态框
+              document.body.removeChild(modal);
+
+              // 开始执行
+              executeChain();
+          } else {
+              alert(`请输入有效的索引 (1-${promptChain.length})`);
+          }
+      });
+
+      // 取消按钮
+      document.getElementById('cancel-start-from').addEventListener('click', () => {
+          document.body.removeChild(modal);
+      });
+
+      // 关闭按钮
+      document.getElementById('close-start-from').addEventListener('click', () => {
+          document.body.removeChild(modal);
+      });
+
+      // 点击背景关闭
+      modal.addEventListener('click', (e) => {
+          if (e.target === modal) {
+              document.body.removeChild(modal);
+          }
+      });
+  }
+
+  // 显示输入数据模态框
+  function showInputModal() {
+      const modal = createInputModal();
+      const textarea = document.getElementById('input-data-textarea');
+      const countEl = document.getElementById('input-char-count');
+
+      // 如果已有输入数据，显示它
+      if (userInput) {
+          textarea.value = userInput;
+      }
+
+      // 实时更新字符计数
+      function updateCount() {
+          countEl.textContent = textarea.value.length;
+      }
+
+      textarea.addEventListener('input', updateCount);
+      updateCount();
+
+      // 开始分析按钮
+      document.getElementById('start-analysis').addEventListener('click', () => {
+          userInput = textarea.value.trim();
+          if (!userInput) {
+              alert('请输入要分析的数据！');
+              return;
+          }
+
+          // 更新状态
+          updateInputStatus();
+          document.getElementById('start-chain').disabled = false;
+          updateStatus('数据已输入，可以开始分析', 0);
+
+          // 关闭模态框
+          document.body.removeChild(modal);
+
+          // 自动开始执行
+          executeChain();
+      });
+
+      // 取消按钮
+      document.getElementById('cancel-input').addEventListener('click', () => {
+          document.body.removeChild(modal);
+      });
+
+      // 关闭按钮
+      document.getElementById('close-input-modal').addEventListener('click', () => {
+          document.body.removeChild(modal);
+      });
+
+      // 点击背景关闭
+      modal.addEventListener('click', (e) => {
+          if (e.target === modal) {
+              document.body.removeChild(modal);
+          }
+      });
+  }
+
+  // 更新输入状态显示
+  function updateInputStatus() {
+      const statusEl = document.getElementById('input-status');
+      if (statusEl) {
+          if (userInput) {
+              const preview = userInput.length > 100 ?
+                  userInput.substring(0, 100) + '...' : userInput;
+              statusEl.textContent = `已输入 ${userInput.length} 字符: ${preview}`;
+          } else {
+              statusEl.textContent = '未输入数据';
+          }
+      }
+  }
+
+  // 更新下一条提示词预览
+  function updateNextPromptPreview() {
+      const nextPromptEl = document.getElementById('next-prompt');
+      if (nextPromptEl) {
+          const nextPrompt = promptChain[currentIndex] || '链条完成';
+          const finalPrompt = userInput ? replacePlaceholders(nextPrompt, userInput) : nextPrompt;
+          nextPromptEl.textContent = finalPrompt.length > 200 ?
+              finalPrompt.substring(0, 200) + '...' : finalPrompt;
+      }
+  }
+
+  // 更新状态显示
+  function updateStatus(status, progress = null) {
+      const statusEl = document.getElementById('status');
+      const progressEl = document.getElementById('current-progress');
+
+      if (statusEl) statusEl.textContent = status;
+      if (progressEl && progress !== null) {
+          progressEl.textContent = `${progress}/${promptChain.length}`;
+      }
+      updateNextPromptPreview();
+  }
+
+  // 查找输入框
+  function findInputBox() {
+      const selectors = [
+          'textarea[data-id="root"]',
+          'textarea[placeholder*="Message"]',
+          'textarea[placeholder*="Send a message"]',
+          '#prompt-textarea',
+          'textarea[rows="1"]',
+          'div[contenteditable="true"]'
+      ];
+
+      for (const selector of selectors) {
+          const element = document.querySelector(selector);
+          if (element) return element;
+      }
+      return null;
+  }
+
+  // 查找发送按钮
+  function findSendButton() {
+      const selectors = [
+          'button[data-testid="send-button"]',
+          'button[aria-label*="Send"]',
+          'button svg[data-icon="send"]',
+          'button:has(svg[data-icon="send"])',
+          '[data-testid="send-button"]'
+      ];
+
+      for (const selector of selectors) {
+          const element = document.querySelector(selector);
+          if (element && !element.disabled) return element;
+      }
+      return null;
+  }
+
+  // 检查是否正在生成回复
+  function isGenerating() {
+      const stopButton = document.querySelector('button[aria-label*="Stop"]') ||
+                        document.querySelector('button[data-testid="stop-button"]') ||
+                        document.querySelector('button:has(svg[data-icon="stop"])');
+
+      if (stopButton) return true;
+
+      const sendButton = findSendButton();
+      return sendButton ? sendButton.disabled : false;
+  }
+
+  // 发送消息
+  function sendMessage(text) {
+      return new Promise((resolve, reject) => {
+          const inputBox = findInputBox();
+          if (!inputBox) {
+              reject(new Error('找不到输入框'));
+              return;
+          }
+
+          // 替换占位符
+          const finalText = replacePlaceholders(text, userInput);
+
+          // 清空并设置文本
+          if (inputBox.tagName === 'TEXTAREA') {
+              inputBox.value = finalText;
+              inputBox.dispatchEvent(new Event('input', { bubbles: true }));
+          } else {
+              inputBox.textContent = finalText;
+              inputBox.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+
+          setTimeout(() => {
+              const sendButton = findSendButton();
+              if (!sendButton || sendButton.disabled) {
+                  reject(new Error('发送按钮不可用'));
+                  return;
+              }
+
+              sendButton.click();
+              resolve();
+          }, 500);
+      });
+  }
+
+  // 等待回复完成
+  function waitForResponse() {
+      return new Promise((resolve, reject) => {
+          const startTime = Date.now();
+
+          const checkInterval = setInterval(() => {
+              if (Date.now() - startTime > CONFIG.MAX_WAIT_TIME) {
+                  clearInterval(checkInterval);
+                  reject(new Error('等待超时'));
+                  return;
+              }
+
+              if (!isGenerating()) {
+                  clearInterval(checkInterval);
+                  resolve();
+              }
+          }, CONFIG.CHECK_INTERVAL);
+      });
+  }
+
+  // 执行提示词链条
+  async function executeChain() {
+      if (isRunning) return;
+
+      // 如果从第1条开始且没有输入数据，要求输入
+      if (currentIndex === 0 && !userInput.trim()) {
+          alert('请先输入分析数据！');
+          showInputModal();
+          return;
+      }
+
+      isRunning = true;
+      updateStatus('运行中...', currentIndex);
+
+      try {
+          while (currentIndex < promptChain.length && isRunning) {
+              const prompt = promptChain[currentIndex];
+              updateStatus(`发送第 ${currentIndex + 1} 条...`, currentIndex);
+
+              await sendMessage(prompt);
+              updateStatus(`等待回复 ${currentIndex + 1}...`, currentIndex);
+
+              await waitForResponse();
+
+              currentIndex++;
+              updateStatus(`完成第 ${currentIndex} 条`, currentIndex);
+
+              if (currentIndex < promptChain.length && isRunning) {
+                  await new Promise(resolve => setTimeout(resolve, CONFIG.SEND_DELAY));
+              }
+          }
+
+          if (isRunning) {
+              updateStatus('分析完成！', currentIndex);
+          }
+      } catch (error) {
+          updateStatus(`错误: ${error.message}`, currentIndex);
+          console.error('执行链条时出错:', error);
+      } finally {
+          isRunning = false;
+      }
+  }
+
+  // 停止执行
+  function stopChain() {
+      isRunning = false;
+      updateStatus('已停止', currentIndex);
+  }
+
+  // 重置链条
+  function resetChain() {
+      stopChain();
+      currentIndex = 0;
+      updateStatus(userInput ? '已重置，可以重新开始' : '等待输入数据', 0);
+  }
+
+    // 创建编辑器模态框
+    function createEditorModal() {
+        const modal = document.createElement('div');
+        modal.id = 'prompt-editor-modal';
+        modal.innerHTML = `
+            <div style="
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0,0,0,0.8);
+                z-index: 20000;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                padding: 20px;
+                box-sizing: border-box;
+            ">
+                <div style="
+                    background: #2d2d2d;
+                    color: white;
+                    padding: 20px;
+                    border-radius: 10px;
+                    width: 90%;
+                    max-width: 1000px;
+                    height: 85%;
+                    display: flex;
+                    flex-direction: column;
+                ">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h3 style="margin: 0; color: #4CAF50;">编辑提示词模板</h3>
+                        <button id="close-editor" style="
+                            background: transparent;
+                            color: #888;
+                            border: none;
+                            font-size: 20px;
+                            cursor: pointer;
+                            padding: 0;
+                            width: 30px;
+                            height: 30px;
+                        ">×</button>
+                    </div>
+
+                    <div style="margin-bottom: 15px; font-size: 14px; color: #ccc;">
+                        <p>📝 <strong>编辑说明：</strong></p>
+                        <ul style="margin: 5px 0; padding-left: 20px;">
+                            <li>使用 <code style="background: #444; padding: 2px 4px; border-radius: 3px;">${PROMPT_SEPARATOR}</code> 来分隔不同的提示词</li>
+                            <li>使用 <code style="background: #444; padding: 2px 4px; border-radius: 3px;">{{INPUT}}</code> 作为用户输入数据的占位符</li>
+                            <li>每个提示词可以包含多行内容</li>
+                            <li>支持换行、空行等格式</li>
+                        </ul>
+                    </div>
+
+                    <textarea id="prompt-editor-textarea" style="
+                        flex: 1;
+                        min-height: 300px;
+                        background: #1a1a1a;
+                        color: white;
+                        border: 1px solid #555;
+                        border-radius: 5px;
+                        padding: 15px;
+                        font-size: 14px;
+                        font-family: 'Consolas', 'Monaco', monospace;
+                        resize: vertical;
+                        outline: none;
+                        line-height: 1.5;
+                    " placeholder="在这里编辑你的提示词模板...">${PROMPT_CHAIN_TEXT}</textarea>
+
+                    <div style="margin-top: 15px; display: flex; justify-content: space-between; align-items: center;">
+                        <div style="font-size: 12px; color: #888;">
+                            当前提示词数量: <span id="editor-prompt-count">${promptChain.length}</span>
+                        </div>
+                        <div>
+                            <button id="save-prompts" style="
+                                background: #4CAF50;
+                                color: white;
+                                border: none;
+                                padding: 10px 20px;
+                                border-radius: 5px;
+                                cursor: pointer;
+                                margin-right: 10px;
+                            ">💾 保存</button>
+                            <button id="cancel-edit" style="
+                                background: #666;
+                                color: white;
+                                border: none;
+                                padding: 10px 20px;
+                                border-radius: 5px;
+                                cursor: pointer;
+                            ">取消</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(modal);
+        return modal;
+    }
+
+    // 显示编辑器
+    function showEditor() {
+        const modal = createEditorModal();
+        const textarea = document.getElementById('prompt-editor-textarea');
+        const countEl = document.getElementById('editor-prompt-count');
+
+        // 实时更新计数
+        function updateCount() {
+            const count = parsePromptChain(textarea.value).length;
+            countEl.textContent = count;
+        }
+
+        textarea.addEventListener('input', updateCount);
+
+        // 保存按钮
+        document.getElementById('save-prompts').addEventListener('click', () => {
+            PROMPT_CHAIN_TEXT = textarea.value;
+            promptChain = parsePromptChain(PROMPT_CHAIN_TEXT);
+
+            // 更新显示
+            document.getElementById('total-prompts').textContent = promptChain.length;
+            updateStatus('模板已更新', currentIndex);
+
+            // 关闭模态框
+            document.body.removeChild(modal);
+        });
+
+        // 取消和关闭按钮
+        document.getElementById('cancel-edit').addEventListener('click', () => {
+            document.body.removeChild(modal);
+        });
+
+        document.getElementById('close-editor').addEventListener('click', () => {
+            document.body.removeChild(modal);
+        });
+
+        // 点击背景关闭
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                document.body.removeChild(modal);
+            }
+        });
+    }
+
+    // 显示预览
+    function showPreview() {
+        const modal = document.createElement('div');
+        modal.id = 'prompt-preview-modal';
+        modal.innerHTML = `
+            <div style="
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0,0,0,0.8);
+                z-index: 20000;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            ">
+                <div style="
+                    background: #2d2d2d;
+                    color: white;
+                    padding: 20px;
+                    border-radius: 10px;
+                    width: 80%;
+                    max-width: 800px;
+                    max-height: 80%;
+                    display: flex;
+                    flex-direction: column;
+                ">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h3 style="margin: 0; color: #4CAF50;">提示词预览</h3>
+                        <button id="close-preview" style="
+                            background: transparent;
+                            color: #888;
+                            border: none;
+                            font-size: 20px;
+                            cursor: pointer;
+                            padding: 0;
+                            width: 30px;
+                            height: 30px;
+                        ">×</button>
+                    </div>
+
+                    <div id="preview-content" style="
+                        flex: 1;
+                        overflow-y: auto;
+                        background: #1a1a1a;
+                        padding: 15px;
+                        border-radius: 5px;
+                        font-family: 'Consolas', 'Monaco', monospace;
+                        font-size: 14px;
+                        line-height: 1.5;
+                        white-space: pre-wrap;
+                    "></div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(modal);
+
+        const content = document.getElementById('preview-content');
+        let previewText = '';
+
+        promptChain.forEach((prompt, index) => {
+            const finalPrompt = userInput ? replacePlaceholders(prompt, userInput) : prompt;
+            previewText += `=== 第 ${index + 1} 条提示词 ===\n\n${finalPrompt}\n\n`;
+        });
+
+        content.textContent = previewText;
+
+        // 关闭按钮
+        document.getElementById('close-preview').addEventListener('click', () => {
+            document.body.removeChild(modal);
+        });
+
+        // 点击背景关闭
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                document.body.removeChild(modal);
+            }
+        });
+    }
+
+    // 切换面板显示
+    function togglePanel() {
+        const content = document.getElementById('panel-content');
+        const toggleBtn = document.getElementById('toggle-panel');
+
+        if (content.style.display === 'none') {
+            content.style.display = 'block';
+            toggleBtn.textContent = '−';
+        } else {
+            content.style.display = 'none';
+            toggleBtn.textContent = '+';
+        }
+    }
+
+    // 初始化
+    function init() {
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+            return;
+        }
+
+        // 初始化提示词链条
+        initPromptChain();
+
+        // 创建控制面板
+        controlPanel = createControlPanel();
+
+        // 绑定事件
+        document.getElementById('input-data').addEventListener('click', showInputModal);
+        document.getElementById('start-chain').addEventListener('click', executeChain);
+        document.getElementById('start-from').addEventListener('click', showStartFromModal);
+        document.getElementById('stop-chain').addEventListener('click', stopChain);
+        document.getElementById('reset-chain').addEventListener('click', resetChain);
+        document.getElementById('edit-prompts').addEventListener('click', showEditor);
+        document.getElementById('preview-prompts').addEventListener('click', showPreview);
+        document.getElementById('toggle-panel').addEventListener('click', togglePanel);
+
+        // 初始化状态
+        updateStatus('等待输入数据', 0);
+        updateInputStatus();
+
+        console.log('ChatGPT 智能分析助手已加载');
+    }
+
+    // 启动
+    init();
+})();
